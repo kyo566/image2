@@ -6,6 +6,5 @@ requests
 torch
 ultralytics
 opencv-python-headless
-#transformers @ git+https://github.com/huggingface/transformers
 torchvision==0.21.0
 transformers==4.36.2
