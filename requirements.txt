@@ -1,5 +1,5 @@
 streamlit==1.44.0
-transformers @ git+https://github.com/huggingface/transformers
+tensorflow==2.15.0
 torch>=1.13
 torchvision==0.21.0
 pillow==11.1.0
