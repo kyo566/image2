@@ -5,6 +5,10 @@ scikit-image>=0.19.3
 matplotlib
 pillow
 requests
-transformers==4.36.2
 ultralytics
 opencv-python-headless
+transformers
+groq
+pypdf
+PyPDF2
+pandas
