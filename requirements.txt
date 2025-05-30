@@ -1,11 +1,10 @@
 streamlit
+torch
+torchvision==0.21.0
 scikit-image>=0.19.3
 matplotlib
 pillow
 requests
-torch
+transformers==4.36.2
 ultralytics
 opencv-python-headless
-torchvision==0.21.0
-transformers==4.36.2
-tensorflow==2.9.1
