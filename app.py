@@ -1,20 +1,33 @@
 import streamlit as st
-import tensorflow as tf
-from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, decode_predictions, preprocess_input
-from tensorflow.keras.preprocessing.image import img_to_array
 from PIL import Image
+import torch
+from torchvision import models, transforms
 import numpy as np
-import matplotlib.pyplot as plt
-from PIL import ImageEnhance
 import matplotlib.cm as cm
-import requests
 from io import BytesIO
+import requests
 
-# Load model
-model = MobileNetV2(weights="imagenet")
-
-st.title("Image Classification Application")
+st.title("Image Classification Application (PyTorch MobileNetV2)")
 st.write("Upload an image and let the model classify it")
+
+# โหลดโมเดล MobileNetV2 pretrained
+model = models.mobilenet_v2(pretrained=True)
+model.eval()
+
+# โหลด labels จาก imagenet
+LABELS_URL = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+labels = requests.get(LABELS_URL).text.splitlines()
+
+# preprocessing transform
+preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], 
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
 
@@ -22,66 +35,81 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     st.image(image, caption="Uploaded Image", use_column_width=True)
 
-    # Preprocess image
-    image_resized = resize(image, (224, 224), anti_aliasing=True)
-    image_resized = (image_resized * 255).astype(np.uint8)
-    #or
-    #image_resized = tf.image.resize(image, (224, 224)).numpy()
+    # preprocess image
+    input_tensor = preprocess(image)
+    input_batch = input_tensor.unsqueeze(0)  # เพิ่มมิติ batch
 
-    img_array = np.array(image_resized)
-    img_array_expanded = np.expand_dims(img_array, axis=0)
-    processed_img = preprocess_input(img_array_expanded)
+    # predict
+    with torch.no_grad():
+        output = model(input_batch)
+        probabilities = torch.nn.functional.softmax(output[0], dim=0)
 
-    # Predict
-    predictions = model.predict(processed_img)
-    decoded_preds = decode_predictions(predictions, top=3)[0]
-
+    # top 3 prediction
+    top3_prob, top3_catid = torch.topk(probabilities, 3)
     st.write("### Predictions:")
-    for i, (imagenet_id, label, prob) in enumerate(decoded_preds):
-        st.write(f"**{i+1}. {label}** ({prob*100:.2f}%)")
-        st.progress(int(prob * 100))
+    for i in range(top3_prob.size(0)):
+        st.write(f"**{labels[top3_catid[i]]}** ({top3_prob[i].item()*100:.2f}%)")
+        st.progress(int(top3_prob[i].item()*100))
 
-    # -------- Grad-CAM --------
+    # ------- Grad-CAM -------
+
     st.write("### Grad-CAM Visualization")
 
-    # Define a model that maps input image to activations & predictions
-    grad_model = tf.keras.models.Model(
-        [model.inputs],
-        [model.get_layer("Conv_1").output, model.output]
-    )
+    # ฟังก์ชันช่วยทำ Grad-CAM
+    def generate_gradcam(model, input_tensor, class_idx):
+        model.zero_grad()
+        features = None
+        gradients = None
 
-    with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(processed_img)
-        pred_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, pred_index]
+        def save_features(module, input, output):
+            nonlocal features
+            features = output
 
-    # Gradient of the output neuron (target class) with respect to feature map
-    grads = tape.gradient(class_channel, conv_outputs)
+        def save_gradients(module, grad_input, grad_output):
+            nonlocal gradients
+            gradients = grad_output[0]
 
-    # Mean intensity of the gradients for each feature map channel
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        # hook บันทึก features และ gradients ที่ layer สุดท้ายก่อน classifier
+        target_layer = model.features[-1]  # Conv_1 equivalent
+        hook_f = target_layer.register_forward_hook(save_features)
+        hook_g = target_layer.register_backward_hook(save_gradients)
 
-    # Multiply each channel in the feature map array by its corresponding gradient importance
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
+        output = model(input_tensor)
+        one_hot = torch.zeros_like(output)
+        one_hot[0, class_idx] = 1
+        output.backward(gradient=one_hot)
 
-    # Normalize heatmap
-    heatmap = np.maximum(heatmap, 0)
-    heatmap /= tf.reduce_max(heatmap)
-    heatmap = heatmap.numpy()
+        hook_f.remove()
+        hook_g.remove()
 
-    # Resize heatmap to original image size
-    heatmap_resized = Image.fromarray(np.uint8(255 * heatmap)).resize(image.size)
+        # global average pooling ของ gradients
+        pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
 
-    # Apply colormap (use matplotlib colormap)
+        # weight feature maps ด้วย pooled gradients
+        for i in range(features.shape[1]):
+            features[0, i, :, :] *= pooled_gradients[i]
+
+        heatmap = features[0].detach().cpu().numpy()
+        heatmap = np.mean(heatmap, axis=0)
+        heatmap = np.maximum(heatmap, 0)
+        heatmap /= np.max(heatmap) + 1e-8  # normalize
+
+        return heatmap
+
+    # สร้าง heatmap Grad-CAM
+    pred_class = top3_catid[0].item()
+    heatmap = generate_gradcam(model, input_batch, pred_class)
+
+    # ย่อ/ขยาย heatmap ให้เท่ากับขนาดรูปต้นฉบับ
+    heatmap_img = Image.fromarray(np.uint8(heatmap * 255)).resize(image.size, resample=Image.BILINEAR)
+
+    # ใช้ colormap ของ matplotlib
     colormap = cm.get_cmap("jet")
-    colored_heatmap = colormap(np.array(heatmap_resized) / 255.0)
-    colored_heatmap = (colored_heatmap[:, :, :3] * 255).astype(np.uint8)
+    colored_heatmap = colormap(np.array(heatmap_img) / 255.0)[:, :, :3]
+    colored_heatmap = (colored_heatmap * 255).astype(np.uint8)
     colored_heatmap_img = Image.fromarray(colored_heatmap)
 
-    # Blend original image and heatmap
+    # ผสม heatmap กับภาพต้นฉบับ
     blended = Image.blend(image, colored_heatmap_img, alpha=0.4)
 
-    # Show result
-    st.image(blended, caption="Grad-CAM Heatmap (No OpenCV)", use_column_width=True)
+    st.image(blended, caption="Grad-CAM Heatmap", use_column_width=True)
